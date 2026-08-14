@@ -38,7 +38,7 @@ jobs:
         id: version
         run: |
           SHORT_SHA=$(git rev-parse --short HEAD)
-          TAG="turboquant-linux-x64-vulkan-${SHORT_SHA}"
+          TAG="turboquant-${SHORT_SHA}"
           echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
           echo "short_sha=${SHORT_SHA}" >> "$GITHUB_OUTPUT"
 
@@ -119,11 +119,10 @@ jobs:
         with:
           tag_name: ${{ steps.version.outputs.tag }}
           target_commitish: ${{ github.sha }}
-          name: "TurboQuant Linux x64 Vulkan (${{ steps.version.outputs.short_sha }})"
+          name: "TurboQuant nightly (${{ steps.version.outputs.short_sha }})"
+          append_body: true
           body: |
             ## TurboQuant KV Cache — Linux x64 (Vulkan)
-
-            Built from `feature/turboquant-kv-cache` branch at commit `${{ steps.version.outputs.short_sha }}`.
 
             ### What's included
             - `llama-server` with `--cache-type-k turbo3` / `turbo4` support

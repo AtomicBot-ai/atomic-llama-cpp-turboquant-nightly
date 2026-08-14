@@ -60,7 +60,7 @@ jobs:
         shell: pwsh
         run: |
           $SHORT_SHA = git rev-parse --short HEAD
-          "tag=turboquant-windows-x64-${{ matrix.variant }}-$SHORT_SHA" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          "tag=turboquant-$SHORT_SHA" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
           "short_sha=$SHORT_SHA" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
 
       - name: ccache
@@ -159,11 +159,10 @@ jobs:
         with:
           tag_name: ${{ steps.version.outputs.tag }}
           target_commitish: ${{ github.sha }}
-          name: "TurboQuant Windows x64 ${{ matrix.variant }} (${{ steps.version.outputs.short_sha }})"
+          name: "TurboQuant nightly (${{ steps.version.outputs.short_sha }})"
+          append_body: true
           body: |
             ## TurboQuant KV Cache — Windows x64 (${{ matrix.variant }})
-
-            Built from `feature/turboquant-kv-cache` branch at commit `${{ steps.version.outputs.short_sha }}`.
 
             ### What's included
             - `llama-server.exe` with `--cache-type-k turbo3` / `turbo4` support
