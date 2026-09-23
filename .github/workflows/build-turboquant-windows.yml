@@ -5,8 +5,9 @@ on:
   push:
     branches:
       - feature/turboquant-kv-cache
+    # Keep this list identical in every build-turboquant-*.yml: one push must build every platform into the same turboquant-<sha> release.
     paths:
-      - '.github/workflows/build-turboquant-windows.yml'
+      - '.github/workflows/build-turboquant-*.yml'
       - '.github/actions/windows-setup-cuda/**'
       - '.github/actions/windows-code-sign/**'
       - '**/CMakeLists.txt'
@@ -18,6 +19,7 @@ on:
       - '**/*.cuh'
       - '**/*.comp'
       - '**/*.glsl'
+      - '**/*.metal'
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.head_ref && github.ref || github.run_id }}
