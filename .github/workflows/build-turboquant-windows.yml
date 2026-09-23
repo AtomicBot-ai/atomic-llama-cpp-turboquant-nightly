@@ -95,7 +95,8 @@ jobs:
         # NOTE: GGML_CUDA_CUB_3DOT2 can be dropped once CCCL 3.2 ships in the CTK used here.
         run: |
           call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvarsall.bat" x64
-          cmake -S . -B build -G "Ninja Multi-Config" ^
+          rem Short build dir: with this repo's long workspace path, rc.exe fails (RC2136) on the deep vulkan-shaders-gen try_compile path. The junction keeps .\build working for later steps.
+          cmake -S . -B C:\tqb -G "Ninja Multi-Config" ^
             -DGGML_NATIVE=OFF ^
             -DGGML_BACKEND_DL=ON ^
             -DGGML_CPU_ALL_VARIANTS=ON ^
@@ -108,8 +109,9 @@ jobs:
             -DLLAMA_BUILD_EXAMPLES=OFF ^
             ${{ matrix.cmake_flags }}
           set /A NINJA_JOBS=%NUMBER_OF_PROCESSORS%-1
-          cmake --build build --config Release -j %NINJA_JOBS% -t ggml
-          cmake --build build --config Release -j %NINJA_JOBS%
+          cmake --build C:\tqb --config Release -j %NINJA_JOBS% -t ggml || exit /b 1
+          cmake --build C:\tqb --config Release -j %NINJA_JOBS% || exit /b 1
+          mklink /J build C:\tqb
 
       - name: Verify turbo3 support
         shell: pwsh
