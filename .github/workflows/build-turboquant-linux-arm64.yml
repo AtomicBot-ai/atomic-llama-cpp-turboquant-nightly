@@ -1,0 +1,185 @@
+name: Build & Release TurboQuant (Linux arm64)
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - feature/turboquant-kv-cache
+    paths:
+      - '.github/workflows/build-turboquant-linux-arm64.yml'
+      - '**/CMakeLists.txt'
+      - '**/*.h'
+      - '**/*.hpp'
+      - '**/*.c'
+      - '**/*.cpp'
+      - '**/*.cu'
+      - '**/*.cuh'
+      - '**/*.comp'
+      - '**/*.glsl'
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref && github.ref || github.run_id }}
+  cancel-in-progress: true
+
+env:
+  LLAMA_LOG_COLORS: 1
+  LLAMA_LOG_PREFIX: 1
+  LLAMA_LOG_TIMESTAMPS: 1
+
+jobs:
+  linux-arm64:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 150
+    permissions:
+      contents: write
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # CUDA build for NVIDIA GB10 (DGX Spark, compute capability 12.1).
+          # Add architectures to CMAKE_CUDA_ARCHITECTURES to cover other
+          # arm64 NVIDIA GPUs; each one adds a full pass over the CUDA kernels.
+          - variant: cuda-13.3
+            image: nvidia/cuda:13.3.0-devel-ubuntu24.04
+            packages: ''
+            cmake_flags: '-DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=121a-real'
+          - variant: vulkan
+            image: ubuntu:24.04
+            packages: 'glslc libvulkan-dev spirv-headers'
+            cmake_flags: '-DGGML_VULKAN=ON'
+
+    # Ubuntu 24.04 with GCC 14, as upstream's arm64 release jobs use: the
+    # armv9.2 CPU variants need -march=armv9.2-a+sme, which GCC 13 and
+    # older reject.
+    container:
+      image: ${{ matrix.image }}
+
+    steps:
+      - name: Dependencies
+        run: |
+          export DEBIAN_FRONTEND=noninteractive
+          apt-get update -y
+          apt-get install -y --no-install-recommends \
+            ca-certificates git zip file binutils cmake ninja-build gcc-14 g++-14 ${{ matrix.packages }}
+          echo "CC=gcc-14" >> "$GITHUB_ENV"
+          echo "CXX=g++-14" >> "$GITHUB_ENV"
+          echo "CUDAHOSTCXX=g++-14" >> "$GITHUB_ENV"
+
+      - name: Clone
+        uses: actions/checkout@v6
+
+      - name: Set version tag
+        id: version
+        run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          SHORT_SHA=$(git rev-parse --short HEAD)
+          TAG="turboquant-${SHORT_SHA}"
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+          echo "short_sha=${SHORT_SHA}" >> "$GITHUB_OUTPUT"
+
+      - name: Build
+        id: cmake_build
+        run: |
+          cmake -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_INSTALL_RPATH='$ORIGIN' \
+            -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON \
+            -DGGML_BACKEND_DL=ON \
+            -DGGML_NATIVE=OFF \
+            -DGGML_CPU_ALL_VARIANTS=ON \
+            -DLLAMA_CURL=OFF \
+            -DLLAMA_OPENSSL=OFF \
+            -DLLAMA_BUILD_SERVER=ON \
+            -DLLAMA_BUILD_TOOLS=ON \
+            -DLLAMA_BUILD_TESTS=OFF \
+            -DLLAMA_BUILD_EXAMPLES=OFF \
+            ${{ matrix.cmake_flags }}
+          cmake --build build --config Release -j $(nproc)
+
+      - name: Verify turbo3 support
+        run: |
+          ./build/bin/llama-server --help 2>&1 | grep -A2 "cache-type-k" || true
+          echo "---"
+          file ./build/bin/llama-server
+          ./build/bin/llama-server --version 2>&1 || true
+
+      - name: Prepare release archive
+        run: |
+          mkdir -p release/build/bin
+          cp build/bin/llama-server release/build/bin/
+          cp build/bin/llama-cli release/build/bin/ 2>/dev/null || true
+          cp build/bin/llama-bench release/build/bin/ 2>/dev/null || true
+          cp build/bin/llama-perplexity release/build/bin/ 2>/dev/null || true
+          find build/bin -name "*.so*" -exec cp -P {} release/build/bin/ \;
+          cp LICENSE release/build/bin/
+          # OpenMP runtime from the same GCC, found via the $ORIGIN rpath.
+          cp -L "$(gcc-14 -print-file-name=libgomp.so.1)" release/build/bin/
+          if [ "${{ matrix.variant }}" != "vulkan" ]; then
+            # Bundle the CUDA runtime and cuBLAS next to libggml-cuda.so
+            # ($ORIGIN rpath), so only the NVIDIA driver is needed.
+            for lib in libcudart.so.13 libcublas.so.13 libcublasLt.so.13; do
+              cp -L "/usr/local/cuda/lib64/$lib" release/build/bin/
+            done
+          fi
+          cd release
+          zip -r ../llama-turboquant-linux-arm64-${{ matrix.variant }}.zip .
+          tar -czf ../llama-turboquant-linux-arm64-${{ matrix.variant }}.tar.gz .
+          cd ..
+          ls -lh llama-turboquant-linux-arm64-${{ matrix.variant }}.zip llama-turboquant-linux-arm64-${{ matrix.variant }}.tar.gz
+
+      - name: Verify bundled dependencies
+        run: |
+          echo "=== Files in the archive ==="
+          ls -lh release/build/bin
+          # Every library must resolve from the archive itself, except the GPU driver ones (libcuda.so.1, libvulkan.so.1).
+          missing=$(for f in release/build/bin/llama-server release/build/bin/*.so*; do
+            [ -L "$f" ] && continue
+            ldd "$f" 2>/dev/null | grep "not found" | grep -v -E "libcuda\.so\.1|libvulkan\.so\.1" | sed "s|^|$(basename "$f"): |"
+          done)
+          if [ -n "$missing" ]; then
+            echo "Unresolved libraries:"
+            echo "$missing"
+            exit 1
+          fi
+          echo "All libraries resolve (libcuda.so.1 / libvulkan.so.1 come from the driver)."
+          echo "=== Highest glibc symbol version required ==="
+          objdump -T release/build/bin/*.so* release/build/bin/llama-server 2>/dev/null | grep -o 'GLIBC_2\.[0-9]*' | sort -uV | tail -1
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: llama-turboquant-linux-arm64-${{ matrix.variant }}
+          path: release/
+          retention-days: 30
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.version.outputs.tag }}
+          target_commitish: ${{ github.sha }}
+          name: "TurboQuant nightly (${{ steps.version.outputs.short_sha }})"
+          append_body: true
+          body: |
+            ## TurboQuant KV Cache - Linux arm64 (${{ matrix.variant }})
+
+            ### What's included
+            - `llama-server` with `--cache-type-k turbo3` / `turbo4` support
+            - `llama-cli`, `llama-bench`, `llama-perplexity`
+            - Dynamically-loaded GGML backends (`GGML_BACKEND_DL`): portable CPU (`GGML_CPU_ALL_VARIANTS`)${{ matrix.variant == 'vulkan' && ' + Vulkan (`libggml-vulkan.so`)' || ' + CUDA 13.3 for GB10 / sm_121 (`libggml-cuda.so` + bundled `libcudart`, `libcublas`, `libcublasLt`)' }}
+
+            ### Requirements
+            ${{ matrix.variant == 'vulkan' && 'A working Vulkan 1.2+ driver (`libvulkan1` + GPU driver).' || 'An NVIDIA GB10 (DGX Spark) with a CUDA 13 driver (580+). The CUDA runtime and cuBLAS are bundled, so no CUDA Toolkit install is required.' }} glibc 2.38 or newer (Ubuntu 24.04, Debian 13, DGX OS 7).
+
+            > GitHub arm64 runners have no GPU, so CI only verifies the build and `llama-server --version/--help`. GPU validation is a manual step on the target hardware.
+
+            ### Usage
+            ```bash
+            unzip llama-turboquant-linux-arm64-${{ matrix.variant }}.zip
+            ./build/bin/llama-server -m model.gguf -ngl 99 --cache-type-k turbo3 --cache-type-v turbo3
+            ```
+          files: |
+            llama-turboquant-linux-arm64-${{ matrix.variant }}.zip
+            llama-turboquant-linux-arm64-${{ matrix.variant }}.tar.gz
+          draft: false
+          prerelease: true
