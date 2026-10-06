@@ -204,3 +204,201 @@ jobs:
             llama-turboquant-windows-x64-${{ matrix.variant }}.zip
           draft: false
           prerelease: true
+
+  # Windows on ARM (Snapdragon X, 8cx, SQ). Cross-compiled on an x64 host with clang and the
+  # fork's cmake/arm64-windows-llvm.cmake toolchain (as upstream's build-cpu.yml does, no vcvarsall).
+  # The binaries cannot run on the x64 host, so they are exercised in windows-arm64-smoke on a
+  # native ARM64 runner, which also publishes them to the same turboquant-<sha> release.
+  windows-arm64:
+    runs-on: windows-2025
+    permissions:
+      contents: read
+    outputs:
+      tag: ${{ steps.version.outputs.tag }}
+      short_sha: ${{ steps.version.outputs.short_sha }}
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Toolchain default -march=armv8.7-a: Snapdragon X (Oryon) and newer.
+          - variant: cpu
+            cmake_flags: ''
+          # Snapdragon 8cx / SQ1-SQ3 crash on armv8.7 instructions; armv8.2-a+dotprod runs on all
+          # Windows on ARM hardware. Overrides the toolchain's CMAKE_<LANG>_FLAGS_INIT, so the
+          # toolchain's warning suppressions are repeated here.
+          - variant: cpu-compat
+            cmake_flags: '-DCMAKE_C_FLAGS="-march=armv8.2-a+dotprod -fvectorize -ffp-model=fast -fno-finite-math-only -Wno-format -Wno-unused-variable -Wno-unused-function -Wno-gnu-zero-variadic-macro-arguments" -DCMAKE_CXX_FLAGS="-march=armv8.2-a+dotprod -fvectorize -ffp-model=fast -fno-finite-math-only -Wno-format -Wno-unused-variable -Wno-unused-function -Wno-gnu-zero-variadic-macro-arguments"'
+
+    steps:
+      - name: Clone
+        uses: actions/checkout@v6
+
+      - name: Set version tag
+        id: version
+        shell: pwsh
+        run: |
+          $SHORT_SHA = git rev-parse --short HEAD
+          "tag=turboquant-$SHORT_SHA" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          "short_sha=$SHORT_SHA" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+
+      - name: ccache
+        uses: ggml-org/ccache-action@v1.2.21
+        with:
+          key: turboquant-windows-arm64-${{ matrix.variant }}
+          evict-old-files: 1d
+
+      - name: Install Ninja
+        run: choco install ninja -y
+
+      - name: Build
+        id: cmake_build
+        shell: cmd
+        run: |
+          rem Short build dir, as in the x64 job. The junction keeps .\build working for later steps.
+          cmake -S . -B C:\tqa -G "Ninja Multi-Config" ^
+            -DCMAKE_TOOLCHAIN_FILE=%GITHUB_WORKSPACE%\cmake\arm64-windows-llvm.cmake ^
+            -DGGML_NATIVE=OFF ^
+            -DGGML_BACKEND_DL=ON ^
+            -DGGML_CPU_ALL_VARIANTS=OFF ^
+            -DGGML_OPENMP=OFF ^
+            -DGGML_RPC=OFF ^
+            -DLLAMA_CURL=OFF ^
+            -DLLAMA_OPENSSL=OFF ^
+            -DLLAMA_BUILD_SERVER=ON ^
+            -DLLAMA_BUILD_TOOLS=ON ^
+            -DLLAMA_BUILD_TESTS=OFF ^
+            -DLLAMA_BUILD_EXAMPLES=OFF ^
+            ${{ matrix.cmake_flags }} || exit /b 1
+          set /A NINJA_JOBS=%NUMBER_OF_PROCESSORS%-1
+          cmake --build C:\tqa --config Release -j %NINJA_JOBS% -t ggml || exit /b 1
+          cmake --build C:\tqa --config Release -j %NINJA_JOBS% || exit /b 1
+          mklink /J build C:\tqa
+
+      - name: Verify ARM64 binaries
+        shell: pwsh
+        run: |
+          # A silently x64 build would pass every later step on this host, so check the PE header:
+          # COFF Machine must be IMAGE_FILE_MACHINE_ARM64 (0xAA64).
+          $files = Get-ChildItem .\build\bin\Release -File | Where-Object { $_.Extension -in '.exe', '.dll' }
+          if (-not $files) { Write-Error "No .exe/.dll in build\bin\Release"; exit 1 }
+          $bad = @()
+          foreach ($f in $files) {
+            $bytes = [IO.File]::ReadAllBytes($f.FullName)
+            $peOffset = [BitConverter]::ToInt32($bytes, 0x3C)
+            $machine = [BitConverter]::ToUInt16($bytes, $peOffset + 4)
+            Write-Output ("{0,-32} 0x{1:X4}" -f $f.Name, $machine)
+            if ($machine -ne 0xAA64) { $bad += $f.Name }
+          }
+          if ($bad.Count -gt 0) {
+            Write-Error "Not ARM64 (machine != 0xAA64): $($bad -join ', ')"
+            exit 1
+          }
+
+      - name: Sign Windows binaries
+        uses: ./.github/actions/windows-code-sign
+        with:
+          path: build\bin\Release
+          sm-api-key: ${{ secrets.SM_API_KEY }}
+          sm-client-cert-b64: ${{ secrets.SM_CLIENT_CERT_FILE_B64 }}
+          sm-client-cert-password: ${{ secrets.SM_CLIENT_CERT_PASSWORD }}
+
+      - name: Prepare release archive
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path release\build\bin | Out-Null
+          Copy-Item .\build\bin\Release\* release\build\bin\ -Recurse -Force
+          Copy-Item .\LICENSE release\build\bin\ -ErrorAction SilentlyContinue
+          Compress-Archive -Path release\build -DestinationPath llama-turboquant-windows-arm64-${{ matrix.variant }}.zip -Force
+          Get-Item llama-turboquant-windows-arm64-${{ matrix.variant }}.zip | Select-Object Name, Length | Format-Table -AutoSize
+
+      # The zip itself is uploaded, so the smoke job tests and publishes the exact signed archive.
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: llama-turboquant-windows-arm64-${{ matrix.variant }}
+          path: llama-turboquant-windows-arm64-${{ matrix.variant }}.zip
+          retention-days: 30
+
+  windows-arm64-smoke:
+    needs: windows-arm64
+    # Run per variant even if the other variant failed to build; a missing artifact fails that leg only.
+    if: ${{ !cancelled() }}
+    runs-on: windows-11-arm
+    permissions:
+      contents: write
+
+    strategy:
+      fail-fast: false
+      matrix:
+        variant: [cpu, cpu-compat]
+
+    steps:
+      - name: Download artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: llama-turboquant-windows-arm64-${{ matrix.variant }}
+
+      - name: Extract
+        shell: pwsh
+        run: |
+          tar -xf llama-turboquant-windows-arm64-${{ matrix.variant }}.zip
+          if ($LASTEXITCODE -ne 0) { Write-Error "tar -xf failed"; exit 1 }
+          Get-ChildItem .\build\bin | Select-Object Name, Length | Format-Table -AutoSize
+
+      - name: Smoke test llama-server
+        shell: pwsh
+        run: |
+          $exe = ".\build\bin\llama-server.exe"
+          & $exe --version 2>&1 | Write-Output
+          if ($LASTEXITCODE -ne 0) { Write-Error "llama-server --version exited with $LASTEXITCODE"; exit 1 }
+          $help = (& $exe --help 2>&1 | Out-String)
+          if ($help -notmatch 'turbo3') {
+            Write-Error "llama-server --help does not list turbo3 among the cache types"
+            exit 1
+          }
+          $help -split "`n" | Select-String -Pattern "cache-type-k" -Context 0,2
+
+      - name: Verify Authenticode signatures
+        shell: pwsh
+        run: |
+          $bad = @()
+          foreach ($f in (Get-ChildItem .\build\bin -File | Where-Object { $_.Extension -in '.exe', '.dll' })) {
+            $sig = Get-AuthenticodeSignature -LiteralPath $f.FullName
+            Write-Output ("{0,-32} {1,-12} {2}" -f $f.Name, $sig.Status, $sig.SignerCertificate.Subject)
+            if ($sig.Status -ne 'Valid') { $bad += $f.Name }
+          }
+          if ($bad.Count -gt 0) { Write-Error "Signature not Valid: $($bad -join ', ')"; exit 1 }
+
+      # Same tag, name and flags as the x64 job's release step, so the arm64 zips land in the same
+      # turboquant-<sha> prerelease. softprops/action-gh-release only uploads (or replaces) the
+      # assets listed in `files`, so it never removes assets added by other jobs.
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.windows-arm64.outputs.tag }}
+          target_commitish: ${{ github.sha }}
+          name: "TurboQuant nightly (${{ needs.windows-arm64.outputs.short_sha }})"
+          append_body: true
+          body: |
+            ## TurboQuant KV Cache — Windows ARM64 (${{ matrix.variant }})
+
+            ### What's included
+            - `llama-server.exe` with `--cache-type-k turbo3` / `turbo4` support
+            - `llama-cli`, `llama-bench`, `llama-perplexity`
+            - Dynamically-loaded GGML backends (`GGML_BACKEND_DL`): single CPU backend built for ${{ matrix.variant == 'cpu' && '`armv8.7-a`' || '`armv8.2-a+dotprod`' }}
+
+            ### Requirements
+            ${{ matrix.variant == 'cpu' && 'Windows on ARM with a Snapdragon X (X Elite / X Plus) or newer CPU. On Snapdragon 8cx / SQ1-SQ3 use the `cpu-compat` zip.' || 'Any Windows on ARM device, including Snapdragon 8cx / SQ1-SQ3. Slower than the `cpu` zip on Snapdragon X.' }} CPU-only, no GPU driver needed.
+
+            > CI runs `llama-server.exe --version/--help` and checks the signatures on a native Windows ARM64 runner. Real `turbo3` inference validation is a manual step on Windows on ARM hardware.
+
+            ### Usage
+            ```bat
+            tar -xf llama-turboquant-windows-arm64-${{ matrix.variant }}.zip
+            .\build\bin\llama-server.exe -m model.gguf --cache-type-k turbo3 --cache-type-v turbo3
+            ```
+          files: |
+            llama-turboquant-windows-arm64-${{ matrix.variant }}.zip
+          draft: false
+          prerelease: true
