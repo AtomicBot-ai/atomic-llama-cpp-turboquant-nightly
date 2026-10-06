@@ -127,12 +127,23 @@ jobs:
         shell: pwsh
         run: |
           $dst = ".\build\bin\Release"
-          Get-ChildItem "$env:CUDA_PATH\bin" -Filter *.dll |
+          # CUDA 13 moved the Windows runtime DLLs from bin\ to bin\x64\. Looking only in bin\
+          # shipped the cuda-13.3 zip without them, so ggml-cuda.dll could not load on a machine
+          # without the CUDA Toolkit and llama-server silently ran on the CPU.
+          $dirs = @("$env:CUDA_PATH\bin", "$env:CUDA_PATH\bin\x64") | Where-Object { Test-Path $_ }
+          Get-ChildItem $dirs -Filter *.dll |
             Where-Object { $_.Name -match '^(cudart64|cublas64|cublasLt64)_.*\.dll$' } |
             ForEach-Object {
-              Write-Output "Bundling $($_.Name)"
+              Write-Output "Bundling $($_.FullName)"
               Copy-Item $_.FullName -Destination $dst -Force
             }
+          # Fail the build rather than publish a CUDA zip that cannot use the GPU.
+          foreach ($lib in 'cudart64_', 'cublas64_', 'cublasLt64_') {
+            if (-not (Get-ChildItem $dst -Filter "$lib*.dll")) {
+              Write-Error "CUDA runtime DLL $lib*.dll not found in $($dirs -join ', '); refusing to package ${{ matrix.variant }}"
+              exit 1
+            }
+          }
 
       - name: Sign Windows binaries
         uses: ./.github/actions/windows-code-sign
